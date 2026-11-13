@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: teabag-qc
+Version: 0.1.0
+Summary: Few-shot teabag anomaly detection with DINOv2 + Qdrant, driving a myCobot 280 Pi
+Requires-Python: >=3.10
+Requires-Dist: torch>=2.1
+Requires-Dist: transformers>=4.40
+Requires-Dist: pillow>=10.0
+Requires-Dist: opencv-python>=4.8
+Requires-Dist: numpy>=1.24
+Requires-Dist: qdrant-client>=1.20
+Provides-Extra: pi
+Requires-Dist: pymycobot; extra == "pi"

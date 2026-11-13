@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+teabag_qc.egg-info/PKG-INFO
+teabag_qc.egg-info/SOURCES.txt
+teabag_qc.egg-info/dependency_links.txt
+teabag_qc.egg-info/entry_points.txt
+teabag_qc.egg-info/requires.txt
+teabag_qc.egg-info/top_level.txt

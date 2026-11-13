@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "teabag-qc"
+version = "0.1.0"
+description = "Few-shot teabag anomaly detection with DINOv2 + Qdrant, driving a myCobot 280 Pi"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.40",
+    "pillow>=10.0",
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+    "qdrant-client>=1.20",  # query_points() needs 1.10+
+]
+
+[project.optional-dependencies]
+# Install on the Raspberry Pi only: pip install ".[pi]"
+pi = ["pymycobot"]
+
+[project.scripts]
+teabag-qc = "teabag_qc:main"
+
+[tool.setuptools]
+py-modules = ["teabag_qc"]
