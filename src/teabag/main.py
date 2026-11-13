@@ -19,10 +19,29 @@ Workflow:
 """
 import argparse
 import json
+import os
 import socket
 import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
+
+# opencv-python's bundled Qt looks for fonts inside the venv, which don't exist.
+# Point it at a system folder that really contains .ttf files, and silence Qt's
+# font warning as a fallback. Must be set BEFORE importing cv2.
+def _find_font_dir() -> str | None:
+    for root in ("/usr/share/fonts", "/usr/local/share/fonts", str(Path.home() / ".fonts")):
+        for dirpath, _dirs, files in os.walk(root):
+            if any(f.lower().endswith(".ttf") for f in files):
+                return dirpath
+    return None
+
+
+_font_dir = _find_font_dir()
+if _font_dir:
+    os.environ["QT_QPA_FONTDIR"] = _font_dir
+os.environ.setdefault("QT_LOGGING_RULES", "default.warning=false")
 
 import cv2
 import numpy as np
@@ -42,7 +61,10 @@ THRESHOLD_FILE = Path("threshold.json")
 SAMPLES_DIR = Path("samples")
 
 PI_HOST, PI_PORT = "192.168.1.50", 9000   # your myCobot's IP
-DRY_RUN = True                            # True = print arm commands instead of sending
+DRY_RUN = False                           # True = print arm commands / HTTP calls instead of sending
+
+ARM_URL = "http://192.168.1.236:8080/run"  # cobot-server on the Pi
+ACTION_FOR = {"bad": "pick", "good": "check_passed"}  # verdict -> cobot-server action
 
 client = QdrantClient(url="http://localhost:6333")
 
@@ -149,10 +171,33 @@ def ask_qdrant(img: Image.Image) -> dict:
     }
 
 
+def trigger_arm(action: str):
+    """POST {"action": <action>} to cobot-server's /run. Expects 202 Accepted."""
+    payload = {"action": action}
+    if DRY_RUN:
+        print(f"   [dry run] POST {ARM_URL} {payload}")
+        return
+    req = urllib.request.Request(
+        ARM_URL,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 202:
+                raise RuntimeError(f"/run replied {resp.status}")
+    except urllib.error.HTTPError as e:
+        if e.code == 409:  # arm still busy with the previous job
+            print("   arm is busy, command skipped")
+        else:
+            raise
+
+
 def sort(result: dict, threshold: float) -> str:
     """Decide good/bad and command the arm."""
     verdict = "bad" if (result["score"] > threshold or result["closest_is_bad"]) else "good"
-    arm_command(verdict)
+    trigger_arm(ACTION_FOR[verdict])  # bad -> "pick", good -> "check_passed"
     return verdict
 
 

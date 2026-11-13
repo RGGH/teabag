@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Teabag QC: a programmer’s guide</title>
+<style>
+:root{--bg:#282828;--bg1:#3c3836;--bg2:#504945;--fg:#ebdbb2;--gray:#928374;--red:#fb4934;--green:#b8bb26;--yellow:#fabd2f;--blue:#83a598;--purple:#d3869b;--aqua:#8ec07c;--orange:#fe8019}
+*{box-sizing:border-box}
+html{background:#1d2021;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+body{margin:0;font:15px/1.65 'CaskaydiaCove Nerd Font','CaskaydiaCove NF','Caskaydia Cove','Cascadia Code','Cascadia Mono',ui-monospace,Menlo,Consolas,monospace;color:var(--fg);counter-reset:p}
+.page{max-width:880px;margin:24px auto;padding:38px 46px 52px;background:var(--bg);border:1px solid var(--bg2);border-radius:6px;counter-increment:p;position:relative}
+.page::after{content:"page " counter(p) " / 15";position:absolute;right:22px;bottom:12px;color:var(--gray);font-size:12px}
+h1{color:var(--yellow);font-size:36px;line-height:1.2;margin:40px 0 10px}
+h2{color:var(--orange);font-size:22px;margin:0 0 14px}
+h2::before{content:counter(p,decimal-leading-zero) "  ";color:var(--gray)}
+h3{color:var(--aqua);font-size:16px;margin:20px 0 6px}
+p{margin:9px 0}
+a{color:var(--blue)}
+code{background:var(--bg1);color:var(--blue);padding:1px 5px;border-radius:3px;font-size:.93em}
+pre{background:#1d2021;border-left:3px solid var(--yellow);padding:12px 16px;overflow-x:auto;border-radius:4px;margin:14px 0;font-size:13.5px;line-height:1.55}
+pre code{background:none;padding:0;color:var(--fg);font-size:inherit}
+.k{color:var(--red)}.s{color:var(--green)}.c{color:var(--gray);font-style:italic}.n{color:var(--purple)}
+aside{border-left:3px solid var(--aqua);background:var(--bg1);padding:9px 16px;margin:16px 0;border-radius:0 4px 4px 0}
+aside.why{border-color:var(--yellow)}aside.py{border-color:var(--purple)}
+aside b{color:var(--yellow)}
+table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
+th{color:var(--yellow);text-align:left}
+td,th{border-bottom:1px solid var(--bg2);padding:6px 8px;vertical-align:top}
+ul,ol{padding-left:22px}li{margin:4px 0}
+.sub{color:var(--gray);font-size:17px}
+@media(max-width:640px){.page{padding:24px 18px 48px}}
+@media print{html{background:var(--bg)}.page{margin:0;border:0;border-radius:0;break-after:page}@page{size:A4;margin:10mm}}
+</style>
+</head>
+<body>
+
+<section class="page">
+<h1>Teabag QC</h1>
+<p class="sub">Few-shot anomaly detection with DINOv2, Qdrant and a robot arm: a programmer’s tour.</p>
+<p>This guide explains what the project does, how every function works, why it is written that way, and which Python features carry the weight. It is pitched at someone who can code but has not met embeddings or vector databases yet. By the end you should be able to rebuild it for your own objects.</p>
+<h3>How to read it</h3>
+<table>
+<tr><th>Pages</th><th>What you get</th></tr>
+<tr><td>2–4</td><td>The idea, the architecture, the data flow</td></tr>
+<tr><td>5–11</td><td>The laptop code, function by function</td></tr>
+<tr><td>12</td><td>The Raspberry Pi arm server</td></tr>
+<tr><td>13</td><td>The live window and the command line</td></tr>
+<tr><td>14</td><td>Python tricks worth stealing</td></tr>
+<tr><td>15</td><td>How to make your own variation</td></tr>
+</table>
+<aside class="why"><b>Two kinds of note.</b> Yellow boxes explain <i>why</i> a design choice was made. Purple boxes call out Python features.</aside>
+</section>
+
+<section class="page">
+<h2>The idea</h2>
+<p>You want to reject bad teabags, but you have no photos of bad ones, and bad can mean torn, stained, crushed or the wrong brand. The trick is to learn what <i>good</i> looks like and flag anything that does not match. This is one-class anomaly detection. It is “few-shot” because 30 to 50 photos are enough.</p>
+<h3>Embeddings in one paragraph</h3>
+<p>An embedding model turns an image into a list of numbers (a vector, 768 of them here). Similar-looking images get vectors that point in similar directions, so “how alike are these two images?” becomes a maths question. Cosine similarity measures the angle between vectors: 1.0 means the same direction, lower means less alike.</p>
+<h3>The algorithm</h3>
+<ol>
+<li><b>Enrol:</b> embed good teabags and store the vectors.</li>
+<li><b>Query:</b> embed a new teabag and find its K nearest good neighbours.</li>
+<li><b>Score:</b> anomaly score = 1 − average similarity to those neighbours.</li>
+<li><b>Decide:</b> a score above a threshold means bad. The threshold comes from good bags you held back.</li>
+</ol>
+<aside class="why"><b>Why one-class?</b> The set of ways a teabag can be wrong is endless and you will never photograph all of them. The set of ways it can be right is small and you control it.</aside>
+</section>
+
+<section class="page">
+<h2>Architecture</h2>
+<pre><code class="plain">  USB camera ──frame──►  LAPTOP (main.py)                  myCobot 280 Pi
+                         ┌────────────────────────┐         ┌──────────────────┐
+                         │ look()   grab + crop   │         │ pi_arm_server.py │
+                         │ embed()  DINOv2 vector │  TCP    │ "good" → bin A   │
+                         │ ask_qdrant() ◄───────┐ │ :9000   │ "bad"  → bin B   │
+                         │ sort()  decide ──────┼─┼────────►│ "home"           │
+                         └──────────────────────┼─┘         └──────────────────┘
+                                                │
+                                         Qdrant (Docker)</code></pre>
+<table>
+<tr><th>Role</th><th>Where</th><th>Job</th></tr>
+<tr><td>Eyes</td><td>USB camera on the laptop</td><td>Fixed overhead view, identical framing every time</td></tr>
+<tr><td>Brain</td><td>Laptop</td><td>Embed, query, decide, command the arm</td></tr>
+<tr><td>Memory</td><td>Qdrant in Docker</td><td>Vectors plus payload (label, image path, time)</td></tr>
+<tr><td>Hands</td><td>Raspberry Pi in the arm</td><td>Move and grip, nothing else</td></tr>
+</table>
+<aside class="why"><b>Why split it like this?</b> The Pi is too weak for a vision model, and a camera on the arm would see a different view each time. Keeping the camera fixed and the thinking on the laptop makes every photo comparable and leaves the Pi with one simple job.</aside>
+</section>
+
+<section class="page">
+<h2>Files and the life of one teabag</h2>
+<pre><code class="plain">teabag/
+├── pyproject.toml          # dependencies + `teabag-qc` command
+├── src/teabag/main.py      # laptop: camera, embeddings, Qdrant, CLI
+├── pi/pi_arm_server.py     # copy to the Pi
+├── samples/                # cropped photos of enrolled bags (runtime)
+└── threshold.json          # decision threshold (runtime)</code></pre>
+<p>Pressing Enter on a bag in <code>run</code> triggers this chain:</p>
+<ol>
+<li><code>look()</code> grabs a frame and crops it to the region of interest (ROI).</li>
+<li><code>embed()</code> turns the crop into a vector.</li>
+<li><code>ask_qdrant()</code> finds the nearest good vectors and returns a score.</li>
+<li><code>sort()</code> compares the score with the threshold.</li>
+<li><code>arm_command()</code> sends <code>good</code> or <code>bad</code> to the Pi.</li>
+<li>The Pi picks the bag and drops it in the right bin.</li>
+</ol>
+<aside><b>Three verbs.</b> <code>look()</code>, <code>ask_qdrant()</code> and <code>sort()</code> are the whole public story. <code>enroll</code> and <code>score</code> reuse the first two, which is why the file stays small.</aside>
+</section>
+
+<section class="page">
+<h2>Config and file layout</h2>
+<p><code>main.py</code> reads top to bottom: config, embedding, Qdrant, the three verbs, the arm, the commands, then <code>main()</code>. Each section only uses things defined above it.</p>
+<pre><code>CAMERA_INDEX = 0
+ROI = (400, 200, 400, 400)            # x, y, w, h
+COLLECTION = "teabags"
+MODEL_NAME = "facebook/dinov2-small"
+K = 3
+THRESHOLD_MARGIN = 1.15
+THRESHOLD_FILE = Path("threshold.json")
+DRY_RUN = True
+client = QdrantClient(url="http://localhost:6333")</code></pre>
+<h3>What each knob does</h3>
+<ul>
+<li><code>ROI</code>: the crop box. Wrong ROI is the most common cause of poor results, because defects shrink as the bag shrinks in the frame.</li>
+<li><code>K</code>: how many neighbours are averaged. One neighbour is noisy; three smooths it out.</li>
+<li><code>THRESHOLD_MARGIN</code>: head-room over the worst held-out good score.</li>
+<li><code>DRY_RUN</code>: print arm commands instead of sending them.</li>
+</ul>
+<aside class="why"><b>Why constants at the top?</b> Everything you will tune sits in one place, and nothing is buried in a function. <code>client</code> is created once at module level so every function shares one connection.</aside>
+<aside class="py"><b>Python:</b> <code>Path("threshold.json")</code> is an object, not a string. You get <code>.write_text()</code>, <code>.read_text()</code> and the <code>/</code> operator for joining paths.</aside>
+</section>
+
+<section class="page">
+<h2>embed(): image to vector</h2>
+<pre><code>@torch.no_grad()
+def embed(img: Image.Image) -&gt; list[float]:
+    processor, model = _load_model()
+    img = img.convert("RGB").resize((224, 224))
+    inputs = processor(images=img, return_tensors="pt",
+                       do_resize=False, do_center_crop=False).to(_device)
+    tokens = model(**inputs).last_hidden_state
+    vec = torch.cat([tokens[:, 0], tokens[:, 1:].mean(dim=1)], dim=-1)
+    vec = torch.nn.functional.normalize(vec, dim=-1)
+    return vec[0].cpu().tolist()</code></pre>
+<h3>Line by line</h3>
+<ul>
+<li><b>Resize ourselves.</b> The default processor resizes then centre-crops, which can slice off the edges of the bag. We resize to a square and switch the crop off. The processor then only normalises colours.</li>
+<li><b><code>last_hidden_state</code></b> holds one vector per image patch (256 of them at 224 px with 14 px patches) plus a CLS token at index 0 that summarises the whole image.</li>
+<li><b>CLS + mean patch.</b> We join the global summary (<code>tokens[:, 0]</code>) with the average of all patches (<code>tokens[:, 1:].mean(dim=1)</code>). That gives 384 + 384 = 768 numbers for the small model.</li>
+<li><b>Normalise</b> to length 1, so cosine similarity is a plain dot product.</li>
+<li><b><code>.cpu().tolist()</code></b> turns a GPU tensor into plain Python floats, which Qdrant’s client accepts.</li>
+</ul>
+<aside class="why"><b>Why DINOv2, not CLIP?</b> DINOv2 is trained to represent visual structure and texture, which is what stains and tears are. CLIP is tuned toward what an image <i>means</i> in words. Swapping is a few lines (page 15).</aside>
+<aside class="py"><b>Python:</b> <code>@torch.no_grad()</code> is a decorator. It switches off gradient tracking, which saves memory and time because we are only running the model, not training it.</aside>
+</section>
+
+<section class="page">
+<h2>Lazy model loading</h2>
+<pre><code>_device = "cuda" if torch.cuda.is_available() else "cpu"
+_processor = _model = None
+
+def _load_model():
+    global _processor, _model
+    if _model is None:
+        _processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
+        _model = AutoModel.from_pretrained(MODEL_NAME).to(_device).eval()
+    return _processor, _model
+
+def vector_size() -&gt; int:
+    _, model = _load_model()
+    return model.config.hidden_size * 2</code></pre>
+<h3>How it works</h3>
+<p>The model is a module-level variable that starts as <code>None</code>. The first call loads it and every later call reuses it. <code>.to(_device)</code> moves the weights to the GPU if there is one. <code>.eval()</code> puts the model in inference mode, which turns off training-only behaviour such as dropout.</p>
+<p><code>vector_size()</code> asks the model how big its output is (<code>hidden_size</code> doubled, because we join two vectors). The Qdrant collection is created with that number, so changing <code>MODEL_NAME</code> adjusts the size automatically.</p>
+<aside class="why"><b>Why lazy?</b> Loading the weights takes seconds. With lazy loading, <code>preview</code> opens instantly because it never touches the model. A class would also work, but a global plus a <code>None</code> check is less code for a one-file tool.</aside>
+<aside class="py"><b>Python:</b> assigning to a module variable inside a function needs <code>global</code>, otherwise Python creates a new local variable. <code>_processor = _model = None</code> is chained assignment, and the leading underscore marks the names as private by convention.</aside>
+<aside><b>Gotcha.</b> If you change the model, the stored vectors have a different size and Qdrant will reject them. Delete the collection and re-enrol.</aside>
+</section>
+
+<section class="page">
+<h2>Qdrant: the memory</h2>
+<pre><code>def ensure_collection():
+    if not client.collection_exists(COLLECTION):
+        client.create_collection(COLLECTION,
+            vectors_config=models.VectorParams(size=vector_size(),
+                                               distance=models.Distance.COSINE))
+        client.create_payload_index(COLLECTION, "label",
+                                    models.PayloadSchemaType.KEYWORD)
+
+def add_sample(img, label):
+    pid = str(uuid.uuid4())
+    path = SAMPLES_DIR / f"{label}_{pid[:8]}.jpg"
+    img.save(path)
+    client.upsert(COLLECTION, points=[models.PointStruct(
+        id=pid, vector=embed(img),
+        payload={"label": label, "path": str(path), "ts": time.time()})])</code></pre>
+<h3>Vocabulary</h3>
+<ul>
+<li><b>Collection:</b> a table of vectors, all the same size.</li>
+<li><b>Point:</b> one row: an ID, a vector and a payload (a free-form dictionary).</li>
+<li><b>Payload index:</b> makes filtering on <code>label</code> fast.</li>
+</ul>
+<h3>What the functions do</h3>
+<p><code>ensure_collection()</code> is safe to call every time, because it only creates the collection if it does not exist. <code>add_sample()</code> saves the crop to disk, embeds it, and stores the vector with the label, file path and timestamp in one <code>upsert</code> (insert-or-update).</p>
+<aside class="why"><b>Why store the path?</b> When a bag is rejected, the payload of its nearest neighbours lets you show a reference photo. A UUID as the ID avoids collisions without needing a counter.</aside>
+<aside class="py"><b>Python:</b> <code>SAMPLES_DIR / f"..."</code> uses operator overloading on <code>Path</code>, and <code>pid[:8]</code> slices the first eight characters for a short filename.</aside>
+</section>
+
+<section class="page">
+<h2>ask_qdrant(): the score</h2>
+<pre><code>def _label_filter(label):
+    return models.Filter(must=[models.FieldCondition(
+        key="label", match=models.MatchValue(value=label))])
+
+def ask_qdrant(img):
+    vec = embed(img)
+    good = client.query_points(COLLECTION, query=vec, limit=K,
+                               query_filter=_label_filter("good"),
+                               with_payload=True).points
+    bad = client.query_points(COLLECTION, query=vec, limit=1,
+                              query_filter=_label_filter("bad"),
+                              with_payload=True).points
+    return {
+        "score": 1.0 - float(np.mean([p.score for p in good])),
+        "neighbours": [p.payload["path"] for p in good],
+        "closest_is_bad": bool(bad) and bad[0].score &gt; good[0].score,
+    }</code></pre>
+<h3>Walkthrough</h3>
+<ul>
+<li>With cosine distance, <code>p.score</code> is the similarity: higher means closer. The anomaly score flips it with <code>1 − mean</code>, so higher means stranger.</li>
+<li>The filter restricts the search to <code>label == "good"</code>. Without it, enrolled bad samples would count as normal.</li>
+<li>The second query finds the nearest <em>bad</em> example. If that is closer than any good one, the bag resembles a known fault.</li>
+</ul>
+<aside class="why"><b>Why a dict?</b> The caller needs a score, reference images and a flag. A dictionary with named keys reads better than a tuple, and adding a field later breaks nothing.</aside>
+<aside class="py"><b>Python:</b> <code>bool(bad) and ...</code> relies on an empty list being falsy: with no bad examples, the expression short-circuits to <code>False</code> and never indexes <code>bad[0]</code>. The <code>float(...)</code> converts a NumPy float into a plain one that serialises cleanly.</aside>
+</section>
+
+<section class="page">
+<h2>look() and grab(): the eyes</h2>
+<pre><code>_cap = None
+
+def grab(flush: int = 5):
+    global _cap
+    if _cap is None:
+        _cap = cv2.VideoCapture(CAMERA_INDEX)
+        time.sleep(1.0)
+    for _ in range(flush):
+        _cap.read()
+    ok, frame = _cap.read()
+    if not ok:
+        raise RuntimeError("Camera read failed")
+    return frame
+
+def look():
+    x, y, w, h = ROI
+    crop = grab()[y:y + h, x:x + w]
+    return Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))</code></pre>
+<h3>Why each piece exists</h3>
+<ul>
+<li><b>One shared camera object</b>, opened on first use (same lazy pattern as the model).</li>
+<li><b>The flush loop.</b> Webcam drivers buffer a few old frames. Reading and discarding them means you embed what is on the tray <i>now</i>. The live preview passes <code>flush=0</code> to stay fast.</li>
+<li><b><code>read()</code> returns <code>(ok, frame)</code></b>, so a failed read is detected rather than silently giving you <code>None</code>.</li>
+<li><b>Slicing.</b> A frame is a NumPy array indexed <code>[row, column]</code>, so the y range comes first. Slicing makes a view, not a copy.</li>
+<li><b>Colour order.</b> OpenCV uses BGR, while PIL and the model expect RGB. Skip the conversion and everything still “works”, with red and blue swapped.</li>
+</ul>
+<aside class="why"><b>Why crop at all?</b> A defect that is 2% of the whole tray is 20% of a tight crop. The embedding sees what fills the frame, so crop to the bag.</aside>
+<aside class="py"><b>Python:</b> <code>x, y, w, h = ROI</code> unpacks a tuple into four names, and <code>for _ in range(flush)</code> uses <code>_</code> to say “I do not need the loop value”.</aside>
+</section>
+
+<section class="page">
+<h2>sort() and arm_command()</h2>
+<pre><code>def sort(result, threshold):
+    verdict = "bad" if (result["score"] &gt; threshold
+                        or result["closest_is_bad"]) else "good"
+    arm_command(verdict)
+    return verdict
+
+def arm_command(cmd):
+    if DRY_RUN:
+        print(f"   [dry run] arm &lt;- {cmd}")
+        return
+    with socket.create_connection((PI_HOST, PI_PORT), timeout=90) as s:
+        s.sendall((cmd + "\n").encode())
+        reply = s.makefile().readline().strip()
+    if reply != "DONE":
+        raise RuntimeError(f"Arm replied: {reply!r}")</code></pre>
+<h3>The decision</h3>
+<p>A bag is bad if its score beats the threshold, <i>or</i> if its nearest neighbour is a known-bad example. Everything else is good. The function returns the verdict so the caller can display it.</p>
+<h3>The protocol</h3>
+<p>The laptop opens a TCP connection, sends one line (<code>good</code>, <code>bad</code> or <code>home</code>), and waits for one line back (<code>DONE</code> or <code>ERR ...</code>). The 90 second timeout covers the arm’s slow move.</p>
+<aside class="why"><b>Why plain sockets, not pymycobot over the network?</b> pymycobot’s API differs between versions, whereas a line of text works with any version and is easy to test with <code>nc</code>. <code>DRY_RUN</code> lets you develop the vision side with no arm attached.</aside>
+<aside class="py"><b>Python:</b> a <code>with</code> block closes the socket even if an exception fires. <code>makefile().readline()</code> wraps the socket as a file so you can read a whole line. <code>{reply!r}</code> in an f-string shows the <i>repr</i>, which makes stray whitespace visible.</aside>
+</section>
+
+<section class="page">
+<h2>The Pi: pi_arm_server.py</h2>
+<pre><code>POSES = {"home": [...], "above_tray": [...], "tray": [...],
+         "above_good": [...], "good": [...], "above_bad": [...], "bad": [...]}
+
+def move(name):
+    mc.send_angles(POSES[name], SPEED)
+    time.sleep(0.5)
+    while mc.is_moving() == 1:
+        time.sleep(0.1)
+
+def pick_and_place(dest):            # dest is "good" or "bad"
+    grip(False); move("above_tray"); move("tray"); grip(True)
+    move("above_tray"); move(f"above_{dest}"); move(dest); grip(False)
+    move(f"above_{dest}"); move("home")</code></pre>
+<h3>How it works</h3>
+<ul>
+<li><b>Taught poses.</b> Each pose is six joint angles you record by hand-moving the arm and calling <code>mc.get_angles()</code>.</li>
+<li><b>Waiting.</b> <code>send_angles</code> returns immediately, so <code>move()</code> sleeps briefly and then polls <code>is_moving()</code> until the arm stops.</li>
+<li><b>Safe approach.</b> Every pick or drop goes <i>above</i> the target first, then down, then back up, so the gripper never drags across the tray.</li>
+<li><b>Server loop.</b> It accepts a connection, reads a line, runs <code>handle()</code>, and replies. Errors are caught and returned as <code>ERR ...</code> so one bad command cannot kill the server.</li>
+</ul>
+<aside class="why"><b>Why the naming trick?</b> Because poses are named <code>good</code>/<code>above_good</code> and <code>bad</code>/<code>above_bad</code>, one function serves both bins via <code>f"above_{dest}"</code>. Adding a third bin means adding two poses, not new code.</aside>
+<aside class="py"><b>Python:</b> <code>SO_REUSEADDR</code> lets you restart the server immediately without “address already in use”. The server has no authentication, so keep it on a trusted network.</aside>
+</section>
+
+<section class="page">
+<h2>The live window and the commands</h2>
+<pre><code>def wait_for_capture(prompt, status="", colour=(0, 255, 0)) -&gt; bool:
+    x, y, w, h = ROI
+    while True:
+        frame = grab(flush=0)
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.putText(frame, prompt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.imshow("teabag", frame)
+        key = cv2.waitKey(30) &amp; 0xFF
+        if key in (13, 32):        # Enter or Space
+            return True
+        if key in (ord("q"), 27):  # q or Esc
+            return False</code></pre>
+<p>This function shows the live camera with the ROI box until you press a key, then returns <code>True</code> (capture) or <code>False</code> (quit). Because it returns a boolean, every command is just a loop around it:</p>
+<pre><code>while wait_for_capture("Enter to inspect, q to quit", status, colour):
+    img = look()
+    result = ask_qdrant(img)
+    verdict = sort(result, threshold)
+    status = f"Last: {verdict.upper()}  score {result['score']:.3f}"</code></pre>
+<h3>The three commands</h3>
+<ul>
+<li><code>enroll</code>: capture, <code>add_sample()</code>, repeat. Breaking early keeps what you have.</li>
+<li><code>score</code>: capture and print scores without storing anything. With <code>--set-threshold</code> it saves <code>max(scores) × 1.15</code> to <code>threshold.json</code>.</li>
+<li><code>run</code>: the loop above, with the last verdict drawn on the live view.</li>
+</ul>
+<aside class="py"><b>Python:</b> <code>cv2.waitKey</code> does two jobs: it pumps the window’s events (without it the window freezes) and returns a key code. <code>&amp; 0xFF</code> keeps the low byte, because some platforms add high bits. <code>key in (13, 32)</code> tests membership in a tuple. <code>main()</code> uses <code>argparse</code> sub-parsers so each command has its own options, and <code>if __name__ == "__main__"</code> keeps imports from running the program.</aside>
+</section>
+
+<section class="page">
+<h2>Python tricks worth stealing</h2>
+<table>
+<tr><th>Feature</th><th>Where</th><th>Why it helps</th></tr>
+<tr><td>Type hints: <code>list[float]</code>, <code>-&gt; bool</code></td><td>embed, wait_for_capture</td><td>Docs and editor help; not enforced at runtime</td></tr>
+<tr><td>Decorator <code>@torch.no_grad()</code></td><td>embed</td><td>Wraps a function without touching its body</td></tr>
+<tr><td><code>global</code> + <code>None</code> sentinel</td><td>_load_model, grab</td><td>Lazy singleton with no class</td></tr>
+<tr><td><code>model(**inputs)</code></td><td>embed</td><td>Unpacks a dict into keyword arguments</td></tr>
+<tr><td>Tuple unpacking</td><td>look, wait_for_capture</td><td>One <code>ROI</code> value, readable names</td></tr>
+<tr><td>NumPy slicing</td><td>look</td><td>Crop with no loop, as a view</td></tr>
+<tr><td><code>for _ in range(n)</code></td><td>grab</td><td>Signals an unused loop variable</td></tr>
+<tr><td><code>with</code> context managers</td><td>arm_command, Pi server</td><td>Resources close even on errors</td></tr>
+<tr><td>f-string formats: <code>{x:.4f}</code>, <code>{v!r}</code></td><td>commands, errors</td><td>Round or show repr in place</td></tr>
+<tr><td>Short-circuit <code>and</code>/<code>or</code></td><td>ask_qdrant, sort</td><td>Guards like “only index if non-empty”</td></tr>
+<tr><td><code>Path</code> and <code>/</code></td><td>add_sample</td><td>Portable path building</td></tr>
+<tr><td><code>key in (13, 32)</code></td><td>wait_for_capture</td><td>Readable multi-value comparison</td></tr>
+<tr><td>Entry point <code>teabag.main:main</code></td><td>pyproject.toml</td><td>Installs a <code>teabag-qc</code> command</td></tr>
+</table>
+<aside class="why"><b>Packaging note.</b> The <code>src/</code> layout plus <code>uv run</code> gives you a managed virtual environment and a pinned dependency set. Run commands from the project root, because <code>samples/</code> and <code>threshold.json</code> are relative paths.</aside>
+</section>
+
+<section class="page">
+<h2>Make it your own</h2>
+<table>
+<tr><th>You want to…</th><th>Change</th></tr>
+<tr><td>Inspect something else (screws, leaves, PCBs)</td><td><code>ROI</code>, <code>COLLECTION</code>, then enrol a new good set</td></tr>
+<tr><td>Try CLIP</td><td><code>MODEL_NAME</code> and the body of <code>embed()</code> (use <code>CLIPModel.get_image_features</code>); delete the collection first</td></tr>
+<tr><td>Catch tiny defects</td><td>Store each patch (<code>tokens[0, 1:]</code>) as a point tagged with an image ID; score by the <i>worst</i> patch, not the average</td></tr>
+<tr><td>Skip Docker</td><td>Replace <code>ask_qdrant()</code> with a NumPy matrix and <code>good @ vec</code></td></tr>
+<tr><td>Inspect many slots</td><td>Make <code>ROI</code> a list, loop over it, add pick poses per slot</td></tr>
+<tr><td>Keep video live during arm moves</td><td>Run <code>arm_command()</code> in a thread</td></tr>
+<tr><td>Use another robot</td><td>Rewrite the Pi server; keep the one-line protocol</td></tr>
+<tr><td>Remove the key press</td><td>Detect motion by differencing frames inside <code>wait_for_capture()</code></td></tr>
+</table>
+<h3>Checklist before trusting results</h3>
+<ul>
+<li>Re-enrol and recalibrate after changing the model, ROI, camera position or lighting.</li>
+<li>Use diffuse light, and lock white balance and exposure so the camera does not drift.</li>
+<li>Enrol varied placements and string positions; calibrate on bags you did <i>not</i> enrol.</li>
+<li>Test with a ladder of faults, from obvious (tape) to subtle (a 2 mm dot), and note where detection stops.</li>
+</ul>
+<aside class="why"><b>Things that bit this project:</b> the wrong <code>/dev/video</code> index, an auto white balance gone cyan, and <code>localhost</code> resolving to IPv6 (use <code>127.0.0.1</code>). All three are environment problems rather than model problems.</aside>
+</section>
+
+<script>
+document.querySelectorAll('pre code:not(.plain)').forEach(e=>{
+ const t=e.textContent.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+ e.innerHTML=t.replace(/(#.*)|(f?"[^"\n]*"|f?'[^'\n]*')|\b(def|return|if|else|while|for|in|with|as|import|from|not|and|or|None|True|False|global|raise|try|except|class|break)\b|\b(0x[0-9A-Fa-f]+|\d+\.?\d*)\b/g,
+ (m,c,s,k,n)=>c?`<span class=c>${c}</span>`:s?`<span class=s>${s}</span>`:k?`<span class=k>${k}</span>`:`<span class=n>${n}</span>`);
+});
+</script>
+</body>
+</html>
